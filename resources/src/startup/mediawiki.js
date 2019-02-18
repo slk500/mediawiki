@@ -1102,6 +1102,12 @@
 			 * @param {Function} [callback] Callback to run after request resolution
 			 */
 			function addScript( src, callback ) {
+				// Use a <script> element rather than XHR. Using XHR changes the request
+				// headers (potentially missing a cache hit), and reduces caching in general
+				// since browsers cache XHR much less (if at all). And XHR means we retrieve
+				// text, so we'd need to eval, which then messes up line numbers.
+				// The drawback is that <script> does not offer progress events, feedback is
+				// only given after downloading, parsing, and execution have completed.
 				var script = document.createElement( 'script' );
 				script.src = src;
 				script.onload = script.onerror = function () {
@@ -2341,9 +2347,11 @@
 
 						try {
 							if ( typeof descriptor.script === 'function' ) {
+								// Function literal: cast to string
 								encodedScript = String( descriptor.script );
 							} else if (
-								// Plain object: an object that is not null and is not an array
+								// Plain object: serialise as object literal (not JSON),
+								// making sure to preserve the functions.
 								typeof descriptor.script === 'object' &&
 								descriptor.script &&
 								!Array.isArray( descriptor.script )
@@ -2358,6 +2366,7 @@
 									} ).join( ',' ) +
 									'}}';
 							} else {
+								// Array of urls, or null.
 								encodedScript = JSON.stringify( descriptor.script );
 							}
 							args = [

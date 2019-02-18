@@ -177,8 +177,8 @@ class SpecialBlock extends FormSpecialPage {
 				'type' => 'radio',
 				'cssclass' => 'mw-block-editing-restriction',
 				'options' => [
-					$this->msg( 'ipb-sitewide' )->text() => 'sitewide',
-					$this->msg( 'ipb-partial' )->text() => 'partial',
+					$this->msg( 'ipb-sitewide' )->escaped() => 'sitewide',
+					$this->msg( 'ipb-partial' )->escaped() => 'partial',
 				],
 				'section' => 'actions',
 			];
@@ -405,7 +405,9 @@ class SpecialBlock extends FormSpecialPage {
 				foreach ( $block->getRestrictions() as $restriction ) {
 					switch ( $restriction->getType() ) {
 						case PageRestriction::TYPE:
-							$pageRestrictions[] = $restriction->getTitle()->getPrefixedText();
+							if ( $restriction->getTitle() ) {
+								$pageRestrictions[] = $restriction->getTitle()->getPrefixedText();
+							}
 							break;
 						case NamespaceRestriction::TYPE:
 							$namespaceRestrictions[] = $restriction->getValue();

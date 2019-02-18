@@ -74,13 +74,11 @@ use Psr\Log\NullLogger;
  *
  * ### Deploying WANObjectCache
  *
- * There are three supported ways to set up broadcasted operations:
+ * There are two supported ways to set up broadcasted operations:
  *
- *   - A) Configure the 'purge' EventRelayer to point to a valid PubSub endpoint
- *        that has subscribed listeners on the cache servers applying the cache updates.
- *   - B) Omit the 'purge' EventRelayer parameter and set up mcrouter as the underlying cache
- *        backend, using a memcached BagOStuff class for the 'cache' parameter. The 'region'
- *        and 'cluster' parameters must be provided and 'mcrouterAware' must be set to `true`.
+ *   - A) Set up mcrouter as the underlying cache backend, using a memcached BagOStuff class
+ *        for the 'cache' parameter. The 'region' and 'cluster' parameters must be provided
+ *        and 'mcrouterAware' must be set to `true`.
  *        Configure mcrouter as follows:
  *          - 1) Use Route Prefixing based on region (datacenter) and cache cluster.
  *               See https://github.com/facebook/mcrouter/wiki/Routing-Prefix and
@@ -90,11 +88,11 @@ use Psr\Log\NullLogger;
  *               configure 'set' and 'delete' operations to go to all servers in the cache
  *               cluster, instead of just one server determined by hashing.
  *               See https://github.com/facebook/mcrouter/wiki/List-of-Route-Handles.
- *   - C) Omit the 'purge' EventRelayer parameter and set up dynomite as cache middleware
- *        between the web servers and either memcached or redis. This will broadcast all
- *        key setting operations, not just purges, which can be useful for cache warming.
- *        Writes are eventually consistent via the Dynamo replication model.
- *        See https://github.com/Netflix/dynomite.
+ *   - B) Set up dynomite as a cache middleware between the web servers and either memcached
+ *        or redis and use it as the underlying cache backend, using a memcached BagOStuff
+ *        class for the 'cache' parameter. This will broadcast all key setting operations,
+ *        not just purges, which can be useful for cache warming. Writes are eventually
+ *        consistent via the Dynamo replication model. See https://github.com/Netflix/dynomite.
  *
  * Broadcasted operations like delete() and touchCheckKey() are done asynchronously
  * in all datacenters this way, though the local one should likely be near immediate.
@@ -120,10 +118,6 @@ class WANObjectCache implements IExpiringStore, LoggerAwareInterface {
 	protected $cache;
 	/** @var MapCacheLRU[] Map of group PHP instance caches */
 	protected $processCaches = [];
-	/** @var string Purge channel name */
-	protected $purgeChannel;
-	/** @var EventRelayer Bus that handles purge broadcasts */
-	protected $purgeRelayer;
 	/** @bar bool Whether to use mcrouter key prefixing for routing */
 	protected $mcrouterAware;
 	/** @var string Physical region for mcrouter use */
@@ -140,9 +134,6 @@ class WANObjectCache implements IExpiringStore, LoggerAwareInterface {
 	protected $asyncHandler;
 	/** @var float Unix timestamp of the oldest possible valid values */
 	protected $epoch;
-
-	/** @var int ERR_* constant for the "last error" registry */
-	protected $lastRelayError = self::ERR_NONE;
 
 	/** @var int Callback stack depth for getWithSetCallback() */
 	private $callbackDepth = 0;
@@ -230,13 +221,9 @@ class WANObjectCache implements IExpiringStore, LoggerAwareInterface {
 
 	const PC_PRIMARY = 'primary:1000'; // process cache name and max key count
 
-	const DEFAULT_PURGE_CHANNEL = 'wancache-purge';
-
 	/**
 	 * @param array $params
 	 *   - cache    : BagOStuff object for a persistent cache
-	 *   - channels : Map of (action => channel string). Actions include "purge".
-	 *   - relayers : Map of (action => EventRelayer object). Actions include "purge".
 	 *   - logger   : LoggerInterface object
 	 *   - stats    : LoggerInterface object
 	 *   - asyncHandler : A function that takes a callback and runs it later. If supplied,
@@ -260,8 +247,6 @@ class WANObjectCache implements IExpiringStore, LoggerAwareInterface {
 	 */
 	public function __construct( array $params ) {
 		$this->cache = $params['cache'];
-		$this->purgeChannel = $params['channels']['purge'] ?? self::DEFAULT_PURGE_CHANNEL;
-		$this->purgeRelayer = $params['relayers']['purge'] ?? new EventRelayerNull( [] );
 		$this->region = $params['region'] ?? 'main';
 		$this->cluster = $params['cluster'] ?? 'wan-main';
 		$this->mcrouterAware = !empty( $params['mcrouterAware'] );
@@ -1238,9 +1223,9 @@ class WANObjectCache implements IExpiringStore, LoggerAwareInterface {
 
 		$preCallbackTime = $this->getCurrentTime();
 		// Determine if a cached value regeneration is needed or desired
-		if ( $value !== false
-			&& $this->isAliveOrInGracePeriod( $curTTL, $graceTTL )
-			&& $this->isValid( $value, $versioned, $asOf, $minTime )
+		if (
+			$this->isValid( $value, $versioned, $asOf, $minTime ) &&
+			$this->isAliveOrInGracePeriod( $curTTL, $graceTTL )
 		) {
 			$preemptiveRefresh = (
 				$this->worthRefreshExpiring( $curTTL, $lowTTL ) ||
@@ -1264,44 +1249,49 @@ class WANObjectCache implements IExpiringStore, LoggerAwareInterface {
 			}
 		}
 
-		// A deleted key with a negative TTL left must be tombstoned
-		$isTombstone = ( $curTTL !== null && $value === false );
-		if ( $isTombstone && $lockTSE <= 0 ) {
-			// Use the INTERIM value for tombstoned keys to reduce regeneration load
-			$lockTSE = self::INTERIM_KEY_TTL;
-		}
-		// Assume a key is hot if requested soon after invalidation
-		$isHot = ( $curTTL !== null && $curTTL <= 0 && abs( $curTTL ) <= $lockTSE );
-		// Use the mutex if there is no value and a busy fallback is given
-		$checkBusy = ( $busyValue !== null && $value === false );
-		// Decide whether a single thread should handle regenerations.
-		// This avoids stampedes when $checkKeys are bumped and when preemptive
-		// renegerations take too long. It also reduces regenerations while $key
-		// is tombstoned. This balances cache freshness with avoiding DB load.
-		$useMutex = ( $isHot || ( $isTombstone && $lockTSE > 0 ) || $checkBusy );
+		// Only a tombstoned key yields no value yet has a (negative) "current time left"
+		$isKeyTombstoned = ( $curTTL !== null && $value === false );
+		// Decide if only one thread should handle regeneration at a time
+		$useMutex =
+			// Note that since tombstones no-op set(), $lockTSE and $curTTL cannot be used to
+			// deduce the key hotness because $curTTL will always keep increasing until the
+			// tombstone expires or is overwritten by a new tombstone. Also, even if $lockTSE
+			// is not set, constant regeneration of a key for the tombstone lifetime might be
+			// very expensive. Assume tombstoned keys are possibly hot in order to reduce
+			// the risk of high regeneration load after the delete() method is called.
+			$isKeyTombstoned ||
+			// Assume a key is hot if requested soon ($lockTSE seconds) after invalidation.
+			// This avoids stampedes when timestamps from $checkKeys/$touchedCallback bump.
+			( $curTTL !== null && $curTTL <= 0 && abs( $curTTL ) <= $lockTSE ) ||
+			// Assume a key is hot if there is no value and a busy fallback is given.
+			// This avoids stampedes on eviction or preemptive regeneration taking too long.
+			( $busyValue !== null && $value === false );
 
 		$lockAcquired = false;
 		if ( $useMutex ) {
 			// Acquire a datacenter-local non-blocking lock
 			if ( $this->cache->add( self::MUTEX_KEY_PREFIX . $key, 1, self::LOCK_TTL ) ) {
-				// Lock acquired; this thread should update the key
+				// Lock acquired; this thread will recompute the value and update cache
 				$lockAcquired = true;
-			} elseif ( $value !== false && $this->isValid( $value, $versioned, $asOf, $minTime ) ) {
+			} elseif ( $this->isValid( $value, $versioned, $asOf, $minTime ) ) {
+				// Lock not acquired and a stale value exists; use the stale value
 				$this->stats->increment( "wanobjectcache.$kClass.hit.stale" );
-				// If it cannot be acquired; then the stale value can be used
+
 				return $value;
 			} else {
-				// Use the INTERIM value for tombstoned keys to reduce regeneration load.
-				// For hot keys, either another thread has the lock or the lock failed;
-				// use the INTERIM value from the last thread that regenerated it.
-				$value = $this->getInterimValue( $key, $versioned, $minTime, $asOf );
-				if ( $value !== false ) {
-					$this->stats->increment( "wanobjectcache.$kClass.hit.volatile" );
+				// Lock not acquired and no stale value exists
+				if ( $isKeyTombstoned ) {
+					// Use the INTERIM value from the last thread that regenerated it if possible
+					$value = $this->getInterimValue( $key, $versioned, $minTime, $asOf );
+					if ( $value !== false ) {
+						$this->stats->increment( "wanobjectcache.$kClass.hit.volatile" );
 
-					return $value;
+						return $value;
+					}
 				}
-				// Use the busy fallback value if nothing else
+
 				if ( $busyValue !== null ) {
+					// Use the busy fallback value if nothing else
 					$miss = is_infinite( $minTime ) ? 'renew' : 'miss';
 					$this->stats->increment( "wanobjectcache.$kClass.$miss.busy" );
 
@@ -1324,24 +1314,24 @@ class WANObjectCache implements IExpiringStore, LoggerAwareInterface {
 		}
 		$valueIsCacheable = ( $value !== false && $ttl >= 0 );
 
-		// When delete() is called, writes are write-holed by the tombstone,
-		// so use a special INTERIM key to pass the new value around threads.
-		if ( ( $isTombstone && $lockTSE > 0 ) && $valueIsCacheable ) {
-			$tempTTL = max( 1, (int)$lockTSE ); // set() expects seconds
-			$newAsOf = $this->getCurrentTime();
-			$wrapped = $this->wrap( $value, $tempTTL, $newAsOf );
-			// Avoid using set() to avoid pointless mcrouter broadcasting
-			$this->setInterimValue( $key, $wrapped, $tempTTL );
-		}
-
-		// Save the value unless a mutex-winning thread is already expected to do that
-		if ( $valueIsCacheable && ( !$useMutex || $lockAcquired ) ) {
-			$setOpts['lockTSE'] = $lockTSE;
-			$setOpts['staleTTL'] = $staleTTL;
-			// Use best known "since" timestamp if not provided
-			$setOpts += [ 'since' => $preCallbackTime ];
-			// Update the cache; this will fail if the key is tombstoned
-			$this->set( $key, $value, $ttl, $setOpts );
+		if ( $valueIsCacheable ) {
+			if ( $isKeyTombstoned ) {
+				// When delete() is called, writes are write-holed by the tombstone,
+				// so use a special INTERIM key to pass the new value among threads.
+				$tempTTL = max( self::INTERIM_KEY_TTL, (int)$lockTSE ); // set() expects seconds
+				$newAsOf = $this->getCurrentTime();
+				$wrapped = $this->wrap( $value, $tempTTL, $newAsOf );
+				// Avoid using set() to avoid pointless mcrouter broadcasting
+				$this->setInterimValue( $key, $wrapped, $tempTTL );
+			} elseif ( !$useMutex || $lockAcquired ) {
+				// Save the value unless a lock-winning thread is already expected to do that
+				$setOpts['lockTSE'] = $lockTSE;
+				$setOpts['staleTTL'] = $staleTTL;
+				// Use best known "since" timestamp if not provided
+				$setOpts += [ 'since' => $preCallbackTime ];
+				// Update the cache; this will fail if the key is tombstoned
+				$this->set( $key, $value, $ttl, $setOpts );
+			}
 		}
 
 		if ( $lockAcquired ) {
@@ -1395,7 +1385,7 @@ class WANObjectCache implements IExpiringStore, LoggerAwareInterface {
 
 		$wrapped = $this->cache->get( self::INTERIM_KEY_PREFIX . $key );
 		list( $value ) = $this->unwrap( $wrapped, $this->getCurrentTime() );
-		if ( $value !== false && $this->isValid( $value, $versioned, $asOf, $minTime ) ) {
+		if ( $this->isValid( $value, $versioned, $asOf, $minTime ) ) {
 			$asOf = $wrapped[self::FLD_TIME];
 
 			return $value;
@@ -1747,15 +1737,6 @@ class WANObjectCache implements IExpiringStore, LoggerAwareInterface {
 	 * @return int ERR_* class constant for the "last error" registry
 	 */
 	final public function getLastError() {
-		if ( $this->lastRelayError ) {
-			// If the cache and the relayer failed, focus on the latter.
-			// An update not making it to the relayer means it won't show up
-			// in other DCs (nor will consistent re-hashing see up-to-date values).
-			// On the other hand, if just the cache update failed, then it should
-			// eventually be applied by the relayer.
-			return $this->lastRelayError;
-		}
-
 		$code = $this->cache->getLastError();
 		switch ( $code ) {
 			case BagOStuff::ERR_NONE:
@@ -1774,7 +1755,6 @@ class WANObjectCache implements IExpiringStore, LoggerAwareInterface {
 	 */
 	final public function clearLastError() {
 		$this->cache->clearLastError();
-		$this->lastRelayError = self::ERR_NONE;
 	}
 
 	/**
@@ -1923,26 +1903,13 @@ class WANObjectCache implements IExpiringStore, LoggerAwareInterface {
 				$this->makePurgeValue( $this->getCurrentTime(), self::HOLDOFF_NONE ),
 				$ttl
 			);
-		} elseif ( $this->purgeRelayer instanceof EventRelayerNull ) {
+		} else {
 			// This handles the mcrouter and the single-DC case
 			$ok = $this->cache->set(
 				$key,
 				$this->makePurgeValue( $this->getCurrentTime(), self::HOLDOFF_NONE ),
 				$ttl
 			);
-		} else {
-			$event = $this->cache->modifySimpleRelayEvent( [
-				'cmd' => 'set',
-				'key' => $key,
-				'val' => 'PURGED:$UNIXTIME$:' . (int)$holdoff,
-				'ttl' => max( $ttl, self::TTL_SECOND ),
-				'sbt' => true, // substitute $UNIXTIME$ with actual microtime
-			] );
-
-			$ok = $this->purgeRelayer->notify( $this->purgeChannel, $event );
-			if ( !$ok ) {
-				$this->lastRelayError = self::ERR_RELAY;
-			}
 		}
 
 		return $ok;
@@ -1959,19 +1926,9 @@ class WANObjectCache implements IExpiringStore, LoggerAwareInterface {
 			// See https://github.com/facebook/mcrouter/wiki/Multi-cluster-broadcast-setup
 			// Wildcards select all matching routes, e.g. the WAN cluster on all DCs
 			$ok = $this->cache->delete( "/*/{$this->cluster}/{$key}" );
-		} elseif ( $this->purgeRelayer instanceof EventRelayerNull ) {
+		} else {
 			// Some other proxy handles broadcasting or there is only one datacenter
 			$ok = $this->cache->delete( $key );
-		} else {
-			$event = $this->cache->modifySimpleRelayEvent( [
-				'cmd' => 'delete',
-				'key' => $key,
-			] );
-
-			$ok = $this->purgeRelayer->notify( $this->purgeChannel, $event );
-			if ( !$ok ) {
-				$this->lastRelayError = self::ERR_RELAY;
-			}
 		}
 
 		return $ok;
@@ -2076,16 +2033,18 @@ class WANObjectCache implements IExpiringStore, LoggerAwareInterface {
 	}
 
 	/**
-	 * Check whether $value is appropriately versioned and not older than $minTime (if set)
+	 * Check if $value is not false, versioned (if needed), and not older than $minTime (if set)
 	 *
-	 * @param array $value
+	 * @param array|bool $value
 	 * @param bool $versioned
 	 * @param float $asOf The time $value was generated
 	 * @param float $minTime The last time the main value was generated (0.0 if unknown)
 	 * @return bool
 	 */
 	protected function isValid( $value, $versioned, $asOf, $minTime ) {
-		if ( $versioned && !isset( $value[self::VFLD_VERSION] ) ) {
+		if ( $value === false ) {
+			return false;
+		} elseif ( $versioned && !isset( $value[self::VFLD_VERSION] ) ) {
 			return false;
 		} elseif ( $minTime > 0 && $asOf < $minTime ) {
 			return false;

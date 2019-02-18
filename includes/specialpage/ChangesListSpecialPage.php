@@ -873,7 +873,9 @@ abstract class ChangesListSpecialPage extends SpecialPage {
 							),
 							'description' =>
 								ChangeTags::truncateTagDescription(
-									$tagName, self::TAG_DESC_CHARACTER_LIMIT, $context
+									$tagName,
+									self::TAG_DESC_CHARACTER_LIMIT,
+									$context
 								),
 							'cssClass' => Sanitizer::escapeClass( 'mw-tag-' . $tagName ),
 							'hits' => $hits,

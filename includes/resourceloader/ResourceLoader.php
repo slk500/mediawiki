@@ -245,6 +245,7 @@ class ResourceLoader implements LoggerAwareInterface {
 		$this->logger = $logger ?: new NullLogger();
 
 		if ( !$config ) {
+			// TODO: Deprecate and remove.
 			$this->logger->debug( __METHOD__ . ' was called without providing a Config instance' );
 			$config = MediaWikiServices::getInstance()->getMainConfig();
 		}
@@ -1218,7 +1219,9 @@ MESSAGE;
 		$name, $scripts, $styles, $messages, $templates
 	) {
 		if ( $scripts instanceof XmlJsCode ) {
-			if ( self::inDebugMode() ) {
+			if ( $scripts->value === '' ) {
+				$scripts = null;
+			} elseif ( self::inDebugMode() ) {
 				$scripts = new XmlJsCode( "function ( $, jQuery, require, module ) {\n{$scripts->value}\n}" );
 			} else {
 				$scripts = new XmlJsCode( 'function($,jQuery,require,module){' . $scripts->value . '}' );
